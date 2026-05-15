@@ -21,4 +21,4 @@ Repository = "https://github.com/kat3ri/ComfyUI-DramaBox"
 [tool.comfy]
 PublisherId = "kayte0342"
 DisplayName = "ComfyUI DramaBox TTS"
-Tags = ["audio", "tts", "voice-cloning", "speech", "expressive"]
+Tags = ["audio", "tts", "voice-cloning", "speech", "expressive", "ltx2", "resemble-ai"]
