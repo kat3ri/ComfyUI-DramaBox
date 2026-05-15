@@ -110,26 +110,52 @@ def _ensure_repo():
 # ---------------------------------------------------------------------------
 
 def _download_models():
-    """Download all required model weights into MODELS_DIR and return paths dict."""
+    """Download all required model weights and return paths dict.
+
+    DramaBox-specific weights (transformer + audio components) go into
+    ``ComfyUI/models/DramaBox/`` so they appear alongside other ComfyUI models.
+
+    The Gemma text encoder is downloaded into the **global HuggingFace cache**
+    (respecting $HF_HOME / ~/.cache/huggingface/hub) rather than the private
+    DramaBox subfolder.  This means:
+      • If the user already has ``unsloth/gemma-3-12b-it-bnb-4bit`` cached
+        from any other tool it will be reused — no re-download.
+      • Future nodes that need the same model will share the single copy.
+    """
     _ensure_repo()
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    cache_dir = str(MODELS_DIR)
+    dramabox_cache = str(MODELS_DIR)
 
     # Import from the DramaBox src we just added to sys.path
-    from model_downloader import get_model_path, get_gemma_path  # noqa: PLC0415
+    from model_downloader import get_model_path  # noqa: PLC0415
+    from huggingface_hub import snapshot_download  # noqa: PLC0415
 
     logger.info("[DramaBox] Verifying model weights (will download if missing)…")
 
-    transformer_path = get_model_path("transformer", cache_dir)
-    audio_components_path = get_model_path("audio_components", cache_dir)
+    # --- DramaBox-unique weights → ComfyUI/models/DramaBox/ ---
+    transformer_path = get_model_path("transformer", dramabox_cache)
+    audio_components_path = get_model_path("audio_components", dramabox_cache)
 
-    # silence_latent is a small helper tensor – best-effort download
+    # silence_latent is a small helper tensor – best-effort
     try:
-        get_model_path("silence_latent", cache_dir)
+        get_model_path("silence_latent", dramabox_cache)
     except Exception as exc:
-        logger.warning(f"[DramaBox] silence_latent optional download failed: {exc}")
+        logger.warning(f"[DramaBox] silence_latent optional download skipped: {exc}")
 
-    gemma_path = get_gemma_path(cache_dir)
+    # --- Gemma text encoder → global HF cache (shared, deduplicates) ---
+    # Passing no cache_dir lets huggingface_hub use $HF_HOME (or the default
+    # ~/.cache/huggingface/hub), so the model is shared across tools/nodes.
+    logger.info(
+        "[DramaBox] Gemma encoder: checking global HF cache "
+        "(unsloth/gemma-3-12b-it-bnb-4bit)…"
+    )
+    hf_token = os.environ.get("HF_TOKEN")
+    gemma_path = snapshot_download(
+        repo_id="unsloth/gemma-3-12b-it-bnb-4bit",
+        token=hf_token,
+        # no cache_dir override → uses $HF_HOME / ~/.cache/huggingface/hub
+    )
+    logger.info(f"[DramaBox] Gemma ready at: {gemma_path}")
 
     return {
         "transformer": transformer_path,
