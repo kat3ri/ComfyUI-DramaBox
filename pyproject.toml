@@ -1,0 +1,24 @@
+[project]
+name = "comfyui-dramabox"
+description = "ComfyUI node for DramaBox — expressive TTS with voice cloning (ResembleAI / LTX-2.3)"
+version = "1.0.0"
+license = { file = "LICENSE" }
+dependencies = [
+    "huggingface_hub>=0.24.0",
+    "transformers>=4.45.0",
+    "accelerate>=0.25.0",
+    "safetensors>=0.4.0",
+    "peft>=0.7.0",
+    "bitsandbytes>=0.43.0",
+    "soundfile",
+    "librosa",
+    "resemble-perth",
+]
+
+[project.urls]
+Repository = "https://github.com/kat3ri/ComfyUI-DramaBox"
+
+[tool.comfy]
+PublisherId = "kayte0342"
+DisplayName = "ComfyUI DramaBox TTS"
+Tags = ["audio", "tts", "voice-cloning", "speech", "expressive"]

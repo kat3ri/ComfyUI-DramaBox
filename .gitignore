@@ -1,0 +1,21 @@
+# Auto-cloned DramaBox source repo (downloaded on first use)
+DramaBox/
+
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.pyd
+.Python
+*.egg-info/
+dist/
+build/
+
+# Temp files created during inference
+dramabox_ref_*.wav
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db

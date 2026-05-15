@@ -1,0 +1,22 @@
+# DramaBox dependencies
+# torch and torchaudio are already provided by ComfyUI – no need to reinstall.
+
+# HuggingFace ecosystem
+huggingface_hub>=0.24.0
+transformers>=4.45.0
+accelerate>=0.25.0
+safetensors>=0.4.0
+
+# LoRA support (used by DramaBox transformer)
+peft>=0.7.0
+
+# 4-bit quantised Gemma text encoder
+bitsandbytes>=0.43.0
+
+# Audio utilities
+soundfile
+librosa
+
+# Resemble Perth imperceptible audio watermarker
+# https://github.com/resemble-ai/Perth
+resemble-perth
