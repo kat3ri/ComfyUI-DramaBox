@@ -112,56 +112,57 @@ def _ensure_repo():
 def _download_models():
     """Download all required model weights and return paths dict.
 
-    DramaBox-specific weights (transformer + audio components) go into
-    ``ComfyUI/models/DramaBox/`` so they appear alongside other ComfyUI models.
-
-    The Gemma text encoder is downloaded into the **global HuggingFace cache**
-    (respecting $HF_HOME / ~/.cache/huggingface/hub) rather than the private
-    DramaBox subfolder.  This means:
-      • If the user already has ``unsloth/gemma-3-12b-it-bnb-4bit`` cached
-        from any other tool it will be reused — no re-download.
-      • Future nodes that need the same model will share the single copy.
+    All models are stored under ``ComfyUI/models/DramaBox/``:
+      - dramabox-dit-v1.safetensors (transformer)
+      - dramabox-audio-components.safetensors (audio components)
+      - gemma-3-12b-it-bnb-4bit/ (Gemma text encoder directory)
     """
     _ensure_repo()
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
-    dramabox_cache = str(MODELS_DIR)
 
-    # Import from the DramaBox src we just added to sys.path
-    from model_downloader import get_model_path  # noqa: PLC0415
-    from huggingface_hub import snapshot_download  # noqa: PLC0415
+    from huggingface_hub import hf_hub_download, snapshot_download  # noqa: PLC0415
 
     logger.info("[DramaBox] Verifying model weights (will download if missing)…")
+    hf_token = os.environ.get("HF_TOKEN")
 
     # --- DramaBox-unique weights → ComfyUI/models/DramaBox/ ---
-    transformer_path = get_model_path("transformer", dramabox_cache)
-    audio_components_path = get_model_path("audio_components", dramabox_cache)
-
-    # silence_latent is a small helper tensor – best-effort
-    try:
-        get_model_path("silence_latent", dramabox_cache)
-    except Exception as exc:
-        logger.warning(f"[DramaBox] silence_latent optional download skipped: {exc}")
-
-    # --- Gemma text encoder → global HF cache (shared, deduplicates) ---
-    # Passing no cache_dir lets huggingface_hub use $HF_HOME (or the default
-    # ~/.cache/huggingface/hub), so the model is shared across tools/nodes.
-    logger.info(
-        "[DramaBox] Gemma encoder: checking global HF cache "
-        "(unsloth/gemma-3-12b-it-bnb-4bit)…"
-    )
-    hf_token = os.environ.get("HF_TOKEN")
-    gemma_path = snapshot_download(
-        repo_id="unsloth/gemma-3-12b-it-bnb-4bit",
-        token=hf_token,
-        # no cache_dir override → uses $HF_HOME / ~/.cache/huggingface/hub
-    )
-    logger.info(f"[DramaBox] Gemma ready at: {gemma_path}")
-
-    return {
-        "transformer": transformer_path,
-        "audio_components": audio_components_path,
-        "gemma_root": gemma_path,
+    dramabox_repo = "ResembleAI/Dramabox"
+    model_files = {
+        "transformer": "dramabox-dit-v1.safetensors",
+        "audio_components": "dramabox-audio-components.safetensors",
     }
+
+    paths = {}
+    for name, filename in model_files.items():
+        local_path = MODELS_DIR / filename
+        if local_path.exists():
+            logger.info(f"[DramaBox] {filename} found locally.")
+        else:
+            logger.info(f"[DramaBox] Downloading {filename} from {dramabox_repo}…")
+            hf_hub_download(
+                repo_id=dramabox_repo,
+                filename=filename,
+                local_dir=str(MODELS_DIR),
+                token=hf_token,
+            )
+            logger.info(f"[DramaBox] {filename} downloaded.")
+        paths[name] = str(local_path)
+
+    # --- Gemma text encoder → ComfyUI/models/DramaBox/ ---
+    gemma_dir = MODELS_DIR / "gemma-3-12b-it-bnb-4bit"
+    if gemma_dir.exists() and any(gemma_dir.iterdir()):
+        logger.info("[DramaBox] Gemma encoder found locally.")
+    else:
+        logger.info("[DramaBox] Downloading Gemma encoder (unsloth/gemma-3-12b-it-bnb-4bit)…")
+        snapshot_download(
+            repo_id="unsloth/gemma-3-12b-it-bnb-4bit",
+            local_dir=str(gemma_dir),
+            token=hf_token,
+        )
+        logger.info("[DramaBox] Gemma encoder downloaded.")
+    paths["gemma_root"] = str(gemma_dir)
+
+    return paths
 
 
 # ---------------------------------------------------------------------------
