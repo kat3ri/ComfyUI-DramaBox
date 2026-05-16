@@ -4,8 +4,8 @@ ComfyUI-DramaBox: Custom nodes for DramaBox expressive TTS with voice cloning.
 Source: https://github.com/resemble-ai/DramaBox
 Models: https://huggingface.co/ResembleAI/Dramabox
 
-This node clones the DramaBox repository on first use and downloads the required
-model weights (~17 GB total) from HuggingFace into ComfyUI/models/DramaBox/.
+This node clones the DramaBox repository on first use and downloads DramaBox
+core weights into ComfyUI/models/DramaBox/.
 """
 
 import os
@@ -15,7 +15,6 @@ import tempfile
 import logging
 import urllib.request
 import zipfile
-import shutil
 from pathlib import Path
 
 import torch
@@ -115,12 +114,11 @@ def _download_models():
     All models are stored under ``ComfyUI/models/DramaBox/``:
       - dramabox-dit-v1.safetensors (transformer)
       - dramabox-audio-components.safetensors (audio components)
-      - gemma-3-12b-it-bnb-4bit/ (Gemma text encoder directory)
     """
     _ensure_repo()
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
 
-    from huggingface_hub import hf_hub_download, snapshot_download  # noqa: PLC0415
+    from huggingface_hub import hf_hub_download  # noqa: PLC0415
 
     logger.info("[DramaBox] Verifying model weights (will download if missing)…")
     hf_token = os.environ.get("HF_TOKEN")
@@ -148,54 +146,108 @@ def _download_models():
             logger.info(f"[DramaBox] {filename} downloaded.")
         paths[name] = str(local_path)
 
-    # --- Gemma text encoder → ComfyUI/models/DramaBox/ ---
-    gemma_dir = MODELS_DIR / "gemma-3-12b-it-bnb-4bit"
-    if gemma_dir.exists() and any(gemma_dir.iterdir()):
-        logger.info("[DramaBox] Gemma encoder found locally.")
-    else:
-        logger.info("[DramaBox] Downloading Gemma encoder (unsloth/gemma-3-12b-it-bnb-4bit)…")
-        snapshot_download(
-            repo_id="unsloth/gemma-3-12b-it-bnb-4bit",
-            local_dir=str(gemma_dir),
-            token=hf_token,
-        )
-        logger.info("[DramaBox] Gemma encoder downloaded.")
-    paths["gemma_root"] = str(gemma_dir)
-
     return paths
 
 
 # ---------------------------------------------------------------------------
 # TTSServer singleton (lazy, loaded on first generate() call)
 # ---------------------------------------------------------------------------
-_tts_server = None
+_CHECKPOINT_EMPTY_OPTION = "<no checkpoints found in models/checkpoints>"
+_tts_servers = {}
 
 
-def _get_server():
-    """Return the cached TTSServer, creating and loading it on first call."""
-    global _tts_server
-    if _tts_server is not None:
-        return _tts_server
+def _list_text_encoder_checkpoints():
+    """Return available ComfyUI checkpoint names for Gemma/LTXV text encoders."""
+    try:
+        checkpoints = sorted(folder_paths.get_filename_list("checkpoints"))
+    except Exception as e:
+        logger.warning(f"[DramaBox] Could not list checkpoints: {e}")
+        checkpoints = []
+    return checkpoints or [_CHECKPOINT_EMPTY_OPTION]
+
+
+def _resolve_checkpoint_path(checkpoint_name: str) -> Path:
+    """Resolve a checkpoint name from ComfyUI's checkpoints folder to an absolute path."""
+    if not checkpoint_name or checkpoint_name == _CHECKPOINT_EMPTY_OPTION:
+        raise ValueError(
+            "[DramaBox] No text encoder checkpoint selected. Place a Gemma/LTXV text encoder "
+            "checkpoint in ComfyUI/models/checkpoints and select it in the node."
+        )
+
+    resolver = getattr(folder_paths, "get_full_path_or_raise", None)
+    if callable(resolver):
+        return Path(resolver("checkpoints", checkpoint_name))
+
+    resolver = getattr(folder_paths, "get_full_path", None)
+    if callable(resolver):
+        path = resolver("checkpoints", checkpoint_name)
+        if path:
+            return Path(path)
+
+    raise ValueError(
+        f"[DramaBox] Could not resolve checkpoint '{checkpoint_name}' from ComfyUI checkpoints."
+    )
+
+
+def _resolve_and_validate_gemma_root(checkpoint_name: str) -> str:
+    """Resolve selected checkpoint and validate it as a usable Gemma/LTXV text encoder root."""
+    checkpoint_path = _resolve_checkpoint_path(checkpoint_name)
+    gemma_root = checkpoint_path if checkpoint_path.is_dir() else checkpoint_path.parent
+
+    if not gemma_root.exists() or not gemma_root.is_dir():
+        raise ValueError(
+            f"[DramaBox] Selected checkpoint path does not resolve to a directory: {checkpoint_path}"
+        )
+
+    has_config = (gemma_root / "config.json").exists()
+    has_tokenizer = any(
+        (gemma_root / name).exists()
+        for name in ("tokenizer.json", "tokenizer.model", "tokenizer_config.json")
+    )
+    has_weights = any(
+        any(gemma_root.glob(pattern))
+        for pattern in ("*.safetensors", "*.bin", "*.pt")
+    )
+
+    if not (has_config and has_tokenizer and has_weights):
+        raise ValueError(
+            "[DramaBox] Selected checkpoint is not a compatible Gemma/LTXV text encoder. "
+            f"Expected config + tokenizer + model weight files in: {gemma_root}\n"
+            "Use the same text-encoder assets used by ComfyUI's native LTXV Audio Text Encoder Loader."
+        )
+
+    return str(gemma_root)
+
+
+def _get_server(gemma_root: str, bnb_4bit: bool):
+    """Return a cached TTSServer keyed by selected text encoder + quantization."""
+    device = "cuda" if torch.cuda.is_available() else "cpu"
+    cache_key = (gemma_root, bool(bnb_4bit), device)
+    if cache_key in _tts_servers:
+        return _tts_servers[cache_key]
 
     _ensure_repo()
     paths = _download_models()
 
     from inference_server import TTSServer  # noqa: PLC0415
 
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    logger.info(f"[DramaBox] Loading TTSServer on {device} (first run may take several minutes)…")
+    logger.info(
+        f"[DramaBox] Loading TTSServer on {device} with encoder '{gemma_root}' "
+        f"(bnb_4bit={bool(bnb_4bit)}) (first run may take several minutes)…"
+    )
 
-    _tts_server = TTSServer(
+    server = TTSServer(
         checkpoint=paths["transformer"],
         full_checkpoint=paths["audio_components"],
-        gemma_root=paths["gemma_root"],
+        gemma_root=gemma_root,
         device=device,
         dtype="bf16",
         compile_model=False,   # torch.compile can be unstable in some setups
-        bnb_4bit=True,         # uses pre-quantised unsloth Gemma weights
+        bnb_4bit=bool(bnb_4bit),
     )
     logger.info("[DramaBox] TTSServer ready.")
-    return _tts_server
+    _tts_servers[cache_key] = server
+    return server
 
 
 # ---------------------------------------------------------------------------
@@ -238,6 +290,25 @@ class DramaBoxTTS:
                             "Scene prompt. Put dialogue in double quotes, stage "
                             "directions outside them. Phonetic sounds (Hahaha, Hmm) "
                             "go inside quotes; named actions (She sighs.) go outside."
+                        ),
+                    },
+                ),
+                "text_encoder_checkpoint": (
+                    _list_text_encoder_checkpoints(),
+                    {
+                        "tooltip": (
+                            "Gemma/LTXV text encoder checkpoint from ComfyUI models/checkpoints. "
+                            "Use the same assets as the native LTXV Audio Text Encoder Loader."
+                        ),
+                    },
+                ),
+                "quantization": (
+                    ["4bit", "none"],
+                    {
+                        "default": "4bit",
+                        "tooltip": (
+                            "Text-encoder quantization mode. Use 4bit for bnb quantized encoders; "
+                            "use none for full-precision encoder weights."
                         ),
                     },
                 ),
@@ -317,6 +388,8 @@ class DramaBoxTTS:
     def generate(
         self,
         text: str,
+        text_encoder_checkpoint: str,
+        quantization: str,
         cfg_scale: float,
         stg_scale: float,
         voice_sample=None,
@@ -326,7 +399,11 @@ class DramaBoxTTS:
         if not text or not text.strip():
             raise ValueError("[DramaBox] Text prompt cannot be empty.")
 
-        server = _get_server()
+        if quantization not in {"4bit", "none"}:
+            raise ValueError(f"[DramaBox] Unsupported quantization mode: {quantization}")
+
+        gemma_root = _resolve_and_validate_gemma_root(text_encoder_checkpoint)
+        server = _get_server(gemma_root=gemma_root, bnb_4bit=(quantization == "4bit"))
 
         # ---- Write voice reference to a temp WAV if an AUDIO input was given ----
         tmp_wav = None

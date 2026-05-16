@@ -39,7 +39,9 @@ pip install -r requirements.txt
 
 On the **first generation**, the node will automatically:
 1. Clone the DramaBox source repo into `custom_nodes/ComfyUI-DramaBox/DramaBox/`
-2. Download model weights (~17 GB) into `ComfyUI/models/DramaBox/`
+2. Download DramaBox core weights (~8.5 GB) into `ComfyUI/models/DramaBox/`
+
+Place your Gemma/LTXV text encoder assets in `ComfyUI/models/checkpoints/` (same source used by ComfyUI's native LTXV Audio Text Encoder Loader), then select the checkpoint in the node input.
 
 ---
 
@@ -52,6 +54,8 @@ On the **first generation**, the node will automatically:
 | Name | Type | Default | Description |
 |------|------|---------|-------------|
 | `text` | STRING | — | Scene prompt (see format below) |
+| `text_encoder_checkpoint` | COMBO | — | Gemma/LTXV text encoder from `ComfyUI/models/checkpoints/` |
+| `quantization` | COMBO | `4bit` | Text encoder quantization mode: `4bit` or `none` |
 | `cfg_scale` | FLOAT | `2.5` | Lower = more natural; higher = more text-faithful |
 | `stg_scale` | FLOAT | `1.5` | Skip-token guidance |
 | `voice_sample` *(optional)* | AUDIO | — | Voice reference for cloning (10+ s recommended) |
@@ -99,20 +103,20 @@ His voice rises with fury, "Kneel, or be destroyed where you stand!"
 
 ## Model Weights
 
-Downloaded automatically from HuggingFace on first run:
+Downloaded automatically from HuggingFace on first run (stored in `ComfyUI/models/DramaBox/`):
 
 | File | Size | Purpose |
 |------|------|---------|
 | `dramabox-dit-v1.safetensors` | 6.6 GB | DiT transformer |
 | `dramabox-audio-components.safetensors` | 1.9 GB | Audio VAE + vocoder + embeddings |
-| `unsloth/gemma-3-12b-it-bnb-4bit` | ~8 GB | Text encoder (4-bit quantised) |
 
-Weights are cached in `ComfyUI/models/DramaBox/` and reused on subsequent runs.
+Text encoder weights are **not** auto-downloaded by this node. Use a Gemma/LTXV text encoder from `ComfyUI/models/checkpoints/`, selected via `text_encoder_checkpoint`.
 
 ---
 
 ## Notes
 
-- The **TTSServer loads all models once** and keeps them warm. The first generation takes several minutes; subsequent generations are ~2–3 seconds on an H100.
+- The **TTSServer is cached per selected text encoder + quantization mode**. The first generation for a new configuration takes several minutes; repeated runs with the same configuration are much faster.
+- The node validates the selected text encoder before loading and will fail early with a clear error if required config/tokenizer/weight files are missing.
 - Output audio is automatically watermarked with [Resemble Perth](https://github.com/resemble-ai/Perth) (imperceptible neural watermark).
 - DramaBox is licensed under the [LTX-2 Community License](https://github.com/resemble-ai/DramaBox/blob/master/LICENSE).
