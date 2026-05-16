@@ -152,68 +152,91 @@ def _download_models():
 # ---------------------------------------------------------------------------
 # TTSServer singleton (lazy, loaded on first generate() call)
 # ---------------------------------------------------------------------------
-_CHECKPOINT_EMPTY_OPTION = "<no checkpoints found in models/checkpoints>"
-_tts_servers = {}
+# Folder types searched for text encoder files, in priority order.
+_ENCODER_EMPTY_OPTION = "<no text encoder found in models/text_encoders or models/checkpoints>"
+_ENCODER_FOLDER_TYPES = ("text_encoders", "checkpoints")
+
 
 
 def _list_text_encoder_checkpoints():
-    """Return available ComfyUI checkpoint names for Gemma/LTXV text encoders."""
-    try:
-        checkpoints = sorted(folder_paths.get_filename_list("checkpoints"))
-    except Exception as e:
-        logger.warning(f"[DramaBox] Could not list checkpoints: {e}")
-        checkpoints = []
-    return checkpoints or [_CHECKPOINT_EMPTY_OPTION]
+    """Return available text encoder filenames from text_encoders and checkpoints folders."""
+    names: list[str] = []
+    seen: set[str] = set()
+    for folder_type in _ENCODER_FOLDER_TYPES:
+        try:
+            for name in sorted(folder_paths.get_filename_list(folder_type)):
+                if name not in seen:
+                    seen.add(name)
+                    names.append(name)
+        except Exception as e:
+            logger.warning(f"[DramaBox] Could not list {folder_type}: {e}")
+    return names or [_ENCODER_EMPTY_OPTION]
 
 
 def _resolve_checkpoint_path(checkpoint_name: str) -> Path:
-    """Resolve a checkpoint name from ComfyUI's checkpoints folder to an absolute path."""
-    if not checkpoint_name or checkpoint_name == _CHECKPOINT_EMPTY_OPTION:
-        raise ValueError(
-            "[DramaBox] No text encoder checkpoint selected. Place a Gemma/LTXV text encoder "
-            "checkpoint in ComfyUI/models/checkpoints and select it in the node."
+    """Resolve a text encoder filename to an absolute path, searching text_encoders then checkpoints."""
+    if not checkpoint_name or checkpoint_name == _ENCODER_EMPTY_OPTION:        raise ValueError(
+            "[DramaBox] No text encoder selected. Place the Gemma encoder directory "
+            "(tokenizer.model + preprocessor_config.json + model*.safetensors) under "
+            "ComfyUI/models/text_encoders/ and select one of its weight files in the node."
         )
 
-    resolver = getattr(folder_paths, "get_full_path_or_raise", None)
-    if callable(resolver):
-        return Path(resolver("checkpoints", checkpoint_name))
+    for folder_type in _ENCODER_FOLDER_TYPES:
+        resolver = getattr(folder_paths, "get_full_path_or_raise", None)
+        if callable(resolver):
+            try:
+                return Path(resolver(folder_type, checkpoint_name))
+            except Exception:
+                pass
 
-    resolver = getattr(folder_paths, "get_full_path", None)
-    if callable(resolver):
-        path = resolver("checkpoints", checkpoint_name)
-        if path:
-            return Path(path)
+        resolver = getattr(folder_paths, "get_full_path", None)
+        if callable(resolver):
+            path = resolver(folder_type, checkpoint_name)
+            if path:
+                return Path(path)
 
     raise ValueError(
-        f"[DramaBox] Could not resolve checkpoint '{checkpoint_name}' from ComfyUI checkpoints."
+        f"[DramaBox] Could not resolve text encoder '{checkpoint_name}' from "
+        "ComfyUI text_encoders or checkpoints folders."
     )
 
 
 def _resolve_and_validate_gemma_root(checkpoint_name: str) -> str:
-    """Resolve selected checkpoint and validate it as a usable Gemma/LTXV text encoder root."""
+    """Resolve the selected .safetensors file to its parent directory and validate it
+    as a usable Gemma encoder root for DramaBox.
+    DramaBox's PromptEncoder uses ``find_matching_file`` (rglob) to locate:
+      - ``tokenizer.model``
+      - ``preprocessor_config.json``
+      - ``model*.safetensors``
+    All three must be present (directly or in a subdirectory) of the resolved root.
+    """
     checkpoint_path = _resolve_checkpoint_path(checkpoint_name)
     gemma_root = checkpoint_path if checkpoint_path.is_dir() else checkpoint_path.parent
 
     if not gemma_root.exists() or not gemma_root.is_dir():
         raise ValueError(
-            f"[DramaBox] Selected checkpoint path does not resolve to a directory: {checkpoint_path}"
+            f"[DramaBox] Selected encoder path does not resolve to a directory: {checkpoint_path}"
         )
 
-    has_config = (gemma_root / "config.json").exists()
-    has_tokenizer = any(
-        (gemma_root / name).exists()
-        for name in ("tokenizer.json", "tokenizer.model", "tokenizer_config.json")
-    )
+    # DramaBox uses rglob internally, so search recursively to match its behaviour.
+    has_tokenizer = any(gemma_root.rglob("tokenizer.model"))
+    has_preprocessor = any(gemma_root.rglob("preprocessor_config.json"))
+    has_weights = any(gemma_root.rglob("model*.safetensors")) or any(gemma_root.rglob("model*.bin"))
     has_weights = any(
         any(gemma_root.glob(pattern))
         for pattern in ("*.safetensors", "*.bin", "*.pt")
     )
 
-    if not (has_config and has_tokenizer and has_weights):
-        raise ValueError(
-            "[DramaBox] Selected checkpoint is not a compatible Gemma/LTXV text encoder. "
-            f"Expected config + tokenizer + model weight files in: {gemma_root}\n"
-            "Use the same text-encoder assets used by ComfyUI's native LTXV Audio Text Encoder Loader."
+    if not (has_tokenizer and has_preprocessor and has_weights):
+            raise ValueError(
+                "[DramaBox] Selected encoder directory is missing required Gemma files.\n"
+                f"Root searched: {gemma_root}\n"
+                "Expected (anywhere inside that directory):\n"
+                "  • tokenizer.model\n"
+                "  • preprocessor_config.json\n"
+                "  • model*.safetensors  (or model*.bin)\n"
+            "Download with: snapshot_download('unsloth/gemma-3-12b-it-bnb-4bit') "
+            "into ComfyUI/models/text_encoders/ and select any of its .safetensors shards."
         )
 
     return str(gemma_root)
@@ -297,8 +320,11 @@ class DramaBoxTTS:
                     _list_text_encoder_checkpoints(),
                     {
                         "tooltip": (
-                            "Gemma/LTXV text encoder checkpoint from ComfyUI models/checkpoints. "
-                            "Use the same assets as the native LTXV Audio Text Encoder Loader."
+                            "Gemma text encoder weight file from ComfyUI models/text_encoders/ "
+                            "(or models/checkpoints/). Select any .safetensors shard from the "
+                            "encoder directory (e.g. unsloth/gemma-3-12b-it-bnb-4bit). "
+                            "The directory must also contain tokenizer.model and "
+                            "preprocessor_config.json."
                         ),
                     },
                 ),
