@@ -8,6 +8,8 @@ This node clones the DramaBox repository on first use and downloads DramaBox
 core weights into ComfyUI/models/DramaBox/.
 """
 
+import gc
+import json
 import os
 import sys
 import subprocess
@@ -108,169 +110,459 @@ def _ensure_repo():
 # Model download helpers
 # ---------------------------------------------------------------------------
 
-def _download_models():
+def _download_models(bnb_4bit: bool = True) -> dict:
     """Download all required model weights and return paths dict.
 
-    All models are stored under ``ComfyUI/models/DramaBox/``:
-      - dramabox-dit-v1.safetensors (transformer)
-      - dramabox-audio-components.safetensors (audio components)
+    DramaBox-specific weights (transformer + audio components) go into
+    ``ComfyUI/models/DramaBox/``.  The Gemma text encoder is downloaded into
+    the global HuggingFace cache (``$HF_HOME`` / ``~/.cache/huggingface/hub``),
+    so it is shared across tools and not re-downloaded if already present.
+
+    ``bnb_4bit=True``  → ``unsloth/gemma-3-12b-it-bnb-4bit``  (~8 GB, recommended)
+    ``bnb_4bit=False`` → ``google/gemma-3-12b-it``             (~25 GB, full precision)
     """
     _ensure_repo()
     MODELS_DIR.mkdir(parents=True, exist_ok=True)
+    dramabox_cache = str(MODELS_DIR)
 
-    from huggingface_hub import hf_hub_download  # noqa: PLC0415
+    from model_downloader import get_model_path   # noqa: PLC0415  (from DramaBox src/)
+    from huggingface_hub import snapshot_download  # noqa: PLC0415
 
     logger.info("[DramaBox] Verifying model weights (will download if missing)…")
-    hf_token = os.environ.get("HF_TOKEN")
 
     # --- DramaBox-unique weights → ComfyUI/models/DramaBox/ ---
-    dramabox_repo = "ResembleAI/Dramabox"
-    model_files = {
-        "transformer": "dramabox-dit-v1.safetensors",
-        "audio_components": "dramabox-audio-components.safetensors",
+    transformer_path = get_model_path("transformer", dramabox_cache)
+    audio_components_path = get_model_path("audio_components", dramabox_cache)
+    try:
+        get_model_path("silence_latent", dramabox_cache)
+    except Exception as exc:
+        logger.warning(f"[DramaBox] silence_latent optional download skipped: {exc}")
+
+    # --- Gemma text encoder → global HF cache ---
+    hf_token = os.environ.get("HF_TOKEN")
+    gemma_repo = "unsloth/gemma-3-12b-it-bnb-4bit" if bnb_4bit else "google/gemma-3-12b-it"
+    logger.info(f"[DramaBox] Gemma encoder: checking cache ({gemma_repo})…")
+    gemma_path = snapshot_download(repo_id=gemma_repo, token=hf_token)
+    logger.info(f"[DramaBox] Gemma ready at: {gemma_path}")
+
+    return {
+        "transformer": transformer_path,
+        "audio_components": audio_components_path,
+        "gemma_root": gemma_path,
     }
 
-    paths = {}
-    for name, filename in model_files.items():
-        local_path = MODELS_DIR / filename
-        if local_path.exists():
-            logger.info(f"[DramaBox] {filename} found locally.")
-        else:
-            logger.info(f"[DramaBox] Downloading {filename} from {dramabox_repo}…")
-            hf_hub_download(
-                repo_id=dramabox_repo,
-                filename=filename,
-                local_dir=str(MODELS_DIR),
-                token=hf_token,
-            )
-            logger.info(f"[DramaBox] {filename} downloaded.")
-        paths[name] = str(local_path)
-
-    return paths
-
 
 # ---------------------------------------------------------------------------
-# TTSServer singleton (lazy, loaded on first generate() call)
+# Generation helpers
 # ---------------------------------------------------------------------------
-# Folder types searched for text encoder files, in priority order.
-_ENCODER_EMPTY_OPTION = "<no text encoder found in models/text_encoders or models/checkpoints>"
-_ENCODER_FOLDER_TYPES = ("text_encoders", "checkpoints")
+_DEFAULT_NEG = (
+    "worst quality, inconsistent, robotic, distorted, noise, static, muffled, "
+    "unclear, unnatural, monotone"
+)
+
+# Persistent model cache for keep-warm mode (populated by _generate_offloaded).
+_model_cache: dict = {}
 
 
-
-def _list_text_encoder_checkpoints():
-    """Return available text encoder filenames from text_encoders and checkpoints folders."""
-    names: list[str] = []
-    seen: set[str] = set()
-    for folder_type in _ENCODER_FOLDER_TYPES:
-        try:
-            for name in sorted(folder_paths.get_filename_list(folder_type)):
-                if name not in seen:
-                    seen.add(name)
-                    names.append(name)
-        except Exception as e:
-            logger.warning(f"[DramaBox] Could not list {folder_type}: {e}")
-    return names or [_ENCODER_EMPTY_OPTION]
+def _flush_model_cache() -> None:
+    """Free all cached model components and release their VRAM."""
+    for key in ("audio_conditioner", "prompt_encoder", "velocity_model", "audio_decoder"):
+        m = _model_cache.pop(key, None)
+        if m is not None:
+            del m
+    _model_cache.pop("_key", None)
+    gc.collect()
+    if torch.cuda.is_available():
+        torch.cuda.empty_cache()
+    logger.info("[DramaBox] Model cache cleared.")
 
 
-def _resolve_checkpoint_path(checkpoint_name: str) -> Path:
-    """Resolve a text encoder filename to an absolute path, searching text_encoders then checkpoints."""
-    if not checkpoint_name or checkpoint_name == _ENCODER_EMPTY_OPTION:        raise ValueError(
-            "[DramaBox] No text encoder selected. Place the Gemma encoder directory "
-            "(tokenizer.model + preprocessor_config.json + model*.safetensors) under "
-            "ComfyUI/models/text_encoders/ and select one of its weight files in the node."
-        )
+def _generate_offloaded(
+    gemma_root: str,
+    bnb_4bit: bool,
+    paths: dict,
+    prompt: str,
+    voice_ref_path,
+    cfg_scale: float,
+    stg_scale: float,
+    duration_multiplier: float,
+    seed: int,
+    keep_warm: bool = False,
+) -> tuple:
+    """Memory-efficient generation: each component is loaded, used, then freed
+    before the next one loads.  Gemma is loaded with device_map='auto' so
+    accelerate distributes its layers across GPU + CPU RAM, preventing the
+    ~8 GB weight spike from OOM-ing an 8 GB GPU.
 
-    for folder_type in _ENCODER_FOLDER_TYPES:
-        resolver = getattr(folder_paths, "get_full_path_or_raise", None)
-        if callable(resolver):
+    When ``keep_warm=True`` all four components are cached in ``_model_cache``
+    and reused on subsequent calls.  Use this on GPUs with 24+ GB VRAM for
+    faster repeated generation; leave off on 8-12 GB cards.
+
+    Stages
+    ------
+    1. AudioConditioner  — encode voice reference, free (or cache)
+    2. PromptEncoder     — encode text (Gemma device_map=auto),
+                           move embeddings to CPU RAM, free (or cache)
+    3. DramaBox DiT      — load transformer, denoise 30 steps, free (or cache)
+    4. AudioDecoder      — decode latent → waveform, free (or cache)
+    """
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    dtype = torch.bfloat16
+
+    # All DramaBox imports are deferred — the repo must be on sys.path first.
+    _ensure_repo()
+
+    from audio_conditioning import AudioConditionByReferenceLatent          # noqa: PLC0415
+    from inference_server import auto_rescale_for_cfg, estimate_duration    # noqa: PLC0415
+    from ltx_core.batch_split import BatchSplitAdapter                      # noqa: PLC0415
+    from ltx_core.components.diffusion_steps import EulerDiffusionStep      # noqa: PLC0415
+    from ltx_core.components.guiders import (                               # noqa: PLC0415
+        MultiModalGuider, MultiModalGuiderParams,
+    )
+    from ltx_core.components.noisers import GaussianNoiser                  # noqa: PLC0415
+    from ltx_core.components.patchifiers import AudioPatchifier             # noqa: PLC0415
+    from ltx_core.components.schedulers import LTX2Scheduler               # noqa: PLC0415
+    from ltx_core.loader import SDOps                                       # noqa: PLC0415
+    from ltx_core.loader.registry import DummyRegistry                     # noqa: PLC0415
+    from ltx_core.loader.single_gpu_model_builder import (                  # noqa: PLC0415
+        SingleGPUModelBuilder as Builder,
+    )
+    from ltx_core.model.audio_vae import encode_audio as vae_encode_audio  # noqa: PLC0415
+    from ltx_core.model.model_protocol import ModelConfigurator            # noqa: PLC0415
+    from ltx_core.model.transformer.attention import AttentionFunction      # noqa: PLC0415
+    from ltx_core.model.transformer.model import (                         # noqa: PLC0415
+        LTXModel, LTXModelType, X0Model,
+    )
+    from ltx_core.model.transformer.rope import LTXRopeType               # noqa: PLC0415
+    from ltx_core.tools import AudioLatentTools                            # noqa: PLC0415
+    from ltx_core.types import Audio, AudioLatentShape, VideoPixelShape    # noqa: PLC0415
+    from ltx_pipelines.utils.blocks import (                               # noqa: PLC0415
+        AudioConditioner, AudioDecoder, PromptEncoder,
+    )
+    from ltx_pipelines.utils.denoisers import (                            # noqa: PLC0415
+        GuidedDenoiser, SimpleDenoiser,
+    )
+    from ltx_pipelines.utils.media_io import decode_audio_from_file        # noqa: PLC0415
+    from ltx_pipelines.utils.samplers import euler_denoising_loop          # noqa: PLC0415
+    from safetensors import safe_open                                       # noqa: PLC0415
+
+    patchifier = AudioPatchifier(patch_size=1)
+
+    # ------------------------------------------------------------------
+    # Cache key — flush stale cache if config changed or warm mode is off.
+    # ------------------------------------------------------------------
+    _cache_key = (gemma_root, paths["audio_components"], paths["transformer"], bnb_4bit)
+    if not keep_warm:
+        if _model_cache:
+            _flush_model_cache()
+    elif _model_cache.get("_key") != _cache_key:
+        logger.info("[DramaBox] Model config changed — flushing warm cache.")
+        _flush_model_cache()
+
+    # ------------------------------------------------------------------
+    # Closure applied only when loading a new PromptEncoder.
+    # The original uses device_map=str(device) which forces all ~8 GB of
+    # the 4-bit Gemma weights onto the GPU at once — fatal on ≤ 8 GB cards.
+    # With device_map="auto" accelerate splits layers across GPU + CPU RAM.
+    # ------------------------------------------------------------------
+    def _low_vram_load_bnb(self_pe, gemma_root_path: str):
+        import json as _j
+        import os as _o
+        import logging as _l
+        from transformers import Gemma3ForConditionalGeneration, BitsAndBytesConfig
+        from ltx_core.text_encoders.gemma.tokenizer import LTXVGemmaTokenizer
+        from ltx_core.text_encoders.gemma.encoders.base_encoder import GemmaTextEncoder
+        from ltx_core.utils import find_matching_file
+
+        prequantized = False
+        cfg_path = _o.path.join(gemma_root_path, "config.json")
+        if _o.path.exists(cfg_path):
             try:
-                return Path(resolver(folder_type, checkpoint_name))
+                with open(cfg_path) as _f:
+                    prequantized = "quantization_config" in _j.load(_f)
             except Exception:
                 pass
 
-        resolver = getattr(folder_paths, "get_full_path", None)
-        if callable(resolver):
-            path = resolver(folder_type, checkpoint_name)
-            if path:
-                return Path(path)
+        from_kwargs: dict = {"device_map": "auto", "torch_dtype": self_pe._dtype}
+        if not prequantized:
+            _l.info("[DramaBox] Loading Gemma with device_map=auto + bitsandbytes 4-bit…")
+            from_kwargs["quantization_config"] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_compute_dtype=self_pe._dtype,
+            )
+        else:
+            _l.info("[DramaBox] Loading pre-quantized Gemma with device_map=auto…")
 
-    raise ValueError(
-        f"[DramaBox] Could not resolve text encoder '{checkpoint_name}' from "
-        "ComfyUI text_encoders or checkpoints folders."
-    )
-
-
-def _resolve_and_validate_gemma_root(checkpoint_name: str) -> str:
-    """Resolve the selected .safetensors file to its parent directory and validate it
-    as a usable Gemma encoder root for DramaBox.
-    DramaBox's PromptEncoder uses ``find_matching_file`` (rglob) to locate:
-      - ``tokenizer.model``
-      - ``preprocessor_config.json``
-      - ``model*.safetensors``
-    All three must be present (directly or in a subdirectory) of the resolved root.
-    """
-    checkpoint_path = _resolve_checkpoint_path(checkpoint_name)
-    gemma_root = checkpoint_path if checkpoint_path.is_dir() else checkpoint_path.parent
-
-    if not gemma_root.exists() or not gemma_root.is_dir():
-        raise ValueError(
-            f"[DramaBox] Selected encoder path does not resolve to a directory: {checkpoint_path}"
+        hf_model = Gemma3ForConditionalGeneration.from_pretrained(
+            gemma_root_path, **from_kwargs
         )
-
-    # DramaBox uses rglob internally, so search recursively to match its behaviour.
-    has_tokenizer = any(gemma_root.rglob("tokenizer.model"))
-    has_preprocessor = any(gemma_root.rglob("preprocessor_config.json"))
-    has_weights = any(gemma_root.rglob("model*.safetensors")) or any(gemma_root.rglob("model*.bin"))
-    has_weights = any(
-        any(gemma_root.glob(pattern))
-        for pattern in ("*.safetensors", "*.bin", "*.pt")
-    )
-
-    if not (has_tokenizer and has_preprocessor and has_weights):
-            raise ValueError(
-                "[DramaBox] Selected encoder directory is missing required Gemma files.\n"
-                f"Root searched: {gemma_root}\n"
-                "Expected (anywhere inside that directory):\n"
-                "  • tokenizer.model\n"
-                "  • preprocessor_config.json\n"
-                "  • model*.safetensors  (or model*.bin)\n"
-            "Download with: snapshot_download('unsloth/gemma-3-12b-it-bnb-4bit') "
-            "into ComfyUI/models/text_encoders/ and select any of its .safetensors shards."
+        tokenizer = LTXVGemmaTokenizer(
+            str(find_matching_file(gemma_root_path, "tokenizer.model").parent), 1024
         )
+        encoder = GemmaTextEncoder(
+            model=hf_model, tokenizer=tokenizer, dtype=self_pe._dtype
+        )
+        if torch.cuda.is_available():
+            _l.info(
+                f"[DramaBox] Gemma loaded: "
+                f"{torch.cuda.memory_allocated() / 1e9:.1f} GB VRAM in use"
+            )
+        return encoder
 
-    return str(gemma_root)
+    # ------------------------------------------------------------------
+    # Duration + target shape
+    # ------------------------------------------------------------------
+    gen_dur = estimate_duration(prompt, duration_multiplier)
+    fps = 25.0
+    n_frames = int(round(gen_dur * fps)) + 1
+    n_frames = ((n_frames - 1 + 4) // 8) * 8 + 1
+    pixel_shape = VideoPixelShape(batch=1, frames=n_frames, height=64, width=64, fps=fps)
+    tgt_shape = AudioLatentShape.from_video_pixel_shape(pixel_shape)
+    audio_tools = AudioLatentTools(patchifier=patchifier, target_shape=tgt_shape)
+    logger.info(f"[DramaBox] Target: {gen_dur:.1f}s audio, {n_frames} latent frames.")
 
+    state = audio_tools.create_initial_state(device, dtype)
+    gen = torch.Generator(device=device).manual_seed(seed)
+    state = GaussianNoiser(generator=gen)(state, noise_scale=1.0)
 
-def _get_server(gemma_root: str, bnb_4bit: bool):
-    """Return a cached TTSServer keyed by selected text encoder + quantization."""
-    device = "cuda" if torch.cuda.is_available() else "cpu"
-    cache_key = (gemma_root, bool(bnb_4bit), device)
-    if cache_key in _tts_servers:
-        return _tts_servers[cache_key]
+    # ------------------------------------------------------------------
+    # Stage 1 / 4 — Voice reference (AudioConditioner: load/cache → encode → free/cache)
+    # ------------------------------------------------------------------
+    if voice_ref_path:
+        logger.info("[DramaBox] Stage 1/4: Encoding voice reference…")
+        voice = decode_audio_from_file(voice_ref_path, device, 0.0, 10.0)
+        if voice is not None:
+            w = voice.waveform
+            if w.dim() == 2:
+                w = (w.repeat(2, 1) if w.shape[0] == 1 else w).unsqueeze(0)
+            elif w.dim() == 3 and w.shape[1] == 1:
+                w = w.repeat(1, 2, 1)
+            target_samples = int(10.0 * voice.sampling_rate)
+            if w.shape[-1] < target_samples:
+                w = w.repeat(1, 1, (target_samples // w.shape[-1]) + 1)
+            w = w[..., :target_samples]
+            peak = w.abs().max()
+            if peak > 0:
+                w = w * (10 ** (-4.0 / 20) / peak)
+            voice = Audio(waveform=w, sampling_rate=voice.sampling_rate)
 
-    _ensure_repo()
-    paths = _download_models()
+            if keep_warm and "audio_conditioner" in _model_cache:
+                logger.info("[DramaBox] Stage 1/4: Using cached AudioConditioner.")
+                ac = _model_cache["audio_conditioner"]
+            else:
+                ac = AudioConditioner(
+                    checkpoint_path=paths["audio_components"], dtype=dtype, device=device
+                )
+                if keep_warm:
+                    _model_cache["audio_conditioner"] = ac
+                    _model_cache["_key"] = _cache_key
 
-    from inference_server import TTSServer  # noqa: PLC0415
+            ref_latent = ac(lambda enc: vae_encode_audio(voice, enc, None))
+            if not keep_warm:
+                del ac
+                gc.collect()
+                torch.cuda.empty_cache()
 
+            state = AudioConditionByReferenceLatent(
+                latent=ref_latent.to(device, dtype), strength=1.0
+            ).apply_to(state, audio_tools)
+            logger.info("[DramaBox] Voice reference encoded.")
+
+    # ------------------------------------------------------------------
+    # Stage 2 / 4 — Text encoding (PromptEncoder / Gemma: load/cache → encode → free/cache)
+    # Embeddings are moved to CPU RAM so VRAM is available for the transformer.
+    # ------------------------------------------------------------------
     logger.info(
-        f"[DramaBox] Loading TTSServer on {device} with encoder '{gemma_root}' "
-        f"(bnb_4bit={bool(bnb_4bit)}) (first run may take several minutes)…"
+        "[DramaBox] Stage 2/4: Encoding text with Gemma "
+        "(device_map=auto distributes layers across GPU + CPU RAM)…"
     )
+    prompts_to_encode = [prompt, _DEFAULT_NEG] if cfg_scale > 1.0 else [prompt]
 
-    server = TTSServer(
-        checkpoint=paths["transformer"],
-        full_checkpoint=paths["audio_components"],
-        gemma_root=gemma_root,
-        device=device,
-        dtype="bf16",
-        compile_model=False,   # torch.compile can be unstable in some setups
-        bnb_4bit=bool(bnb_4bit),
+    if keep_warm and "prompt_encoder" in _model_cache:
+        logger.info("[DramaBox] Stage 2/4: Using cached PromptEncoder.")
+        pe = _model_cache["prompt_encoder"]
+        ctx = pe(prompts_to_encode)
+    else:
+        _orig_load_bnb = PromptEncoder._load_bnb_4bit_encoder
+        PromptEncoder._load_bnb_4bit_encoder = _low_vram_load_bnb
+        try:
+            pe = PromptEncoder(
+                checkpoint_path=paths["audio_components"],
+                gemma_root=gemma_root,
+                dtype=dtype,
+                device=device,
+                use_bnb_4bit=bnb_4bit,
+                warm=True,       # triggers our patched _load_bnb_4bit_encoder
+                audio_only=True,
+            )
+            ctx = pe(prompts_to_encode)
+        finally:
+            PromptEncoder._load_bnb_4bit_encoder = _orig_load_bnb
+        if keep_warm:
+            _model_cache["prompt_encoder"] = pe
+            _model_cache["_key"] = _cache_key
+
+    # Pin embeddings to CPU so Gemma's VRAM is freed before the transformer loads.
+    a_ctx = ctx[0].audio_encoding.cpu()
+    a_ctx_neg = ctx[1].audio_encoding.cpu() if cfg_scale > 1.0 else None
+    del ctx
+    if not keep_warm:
+        del pe
+        gc.collect()
+        torch.cuda.empty_cache()
+    logger.info("[DramaBox] Text encoded.")
+
+    # ------------------------------------------------------------------
+    # Stage 3 / 4 — Denoising (DramaBox DiT: load/cache → denoise → free/cache)
+    # ------------------------------------------------------------------
+    logger.info("[DramaBox] Stage 3/4: Loading transformer and running 30-step denoising…")
+
+    with safe_open(paths["transformer"], framework="pt") as _sf:
+        _config = json.loads(_sf.metadata()["config"])
+
+    class _AudioOnlyConfigurator(ModelConfigurator[LTXModel]):
+        @classmethod
+        def from_config(cls, cfg):
+            t = cfg.get("transformer", {})
+            cp = None
+            if not t.get("caption_proj_before_connector", False):
+                from ltx_core.model.transformer.text_projection import (  # noqa: PLC0415
+                    create_caption_projection,
+                )
+                with torch.device("meta"):
+                    cp = create_caption_projection(t, audio=True)
+            return LTXModel(
+                model_type=LTXModelType.AudioOnly,
+                audio_num_attention_heads=t.get("audio_num_attention_heads", 32),
+                audio_attention_head_dim=t.get("audio_attention_head_dim", 64),
+                audio_in_channels=t.get("audio_in_channels", 128),
+                audio_out_channels=t.get("audio_out_channels", 128),
+                num_layers=t.get("num_layers", 48),
+                audio_cross_attention_dim=t.get("audio_cross_attention_dim", 2048),
+                norm_eps=t.get("norm_eps", 1e-6),
+                attention_type=AttentionFunction(t.get("attention_type", "default")),
+                positional_embedding_theta=10000.0,
+                audio_positional_embedding_max_pos=[20.0],
+                timestep_scale_multiplier=t.get("timestep_scale_multiplier", 1000),
+                use_middle_indices_grid=t.get("use_middle_indices_grid", True),
+                rope_type=LTXRopeType(t.get("rope_type", "interleaved")),
+                double_precision_rope=(
+                    t.get("frequencies_precision", False) == "float64"
+                ),
+                apply_gated_attention=t.get("apply_gated_attention", False),
+                audio_caption_projection=cp,
+                cross_attention_adaln=t.get("cross_attention_adaln", False),
+            )
+
+    if keep_warm and "velocity_model" in _model_cache:
+        logger.info("[DramaBox] Stage 3/4: Using cached transformer.")
+        velocity_model = _model_cache["velocity_model"]
+    else:
+        audio_sd_ops = (
+            SDOps("AO")
+            .with_matching(prefix="model.diffusion_model.")
+            .with_replacement("model.diffusion_model.", "")
+        )
+        velocity_model = (
+            Builder(
+                model_path=paths["transformer"],
+                model_class_configurator=_AudioOnlyConfigurator,
+                model_sd_ops=audio_sd_ops,
+                registry=DummyRegistry(),
+            )
+            .build(device=device, dtype=dtype)
+            .to(device)
+            .eval()
+        )
+        if keep_warm:
+            _model_cache["velocity_model"] = velocity_model
+            _model_cache["_key"] = _cache_key
+
+    # Move embeddings back to GPU for the denoising loop.
+    a_ctx = a_ctx.to(device)
+    if a_ctx_neg is not None:
+        a_ctx_neg = a_ctx_neg.to(device)
+
+    sigmas = LTX2Scheduler().execute(steps=30, latent=state.latent).to(device)
+    resc = auto_rescale_for_cfg(cfg_scale)
+    if cfg_scale > 1.0:
+        denoiser: GuidedDenoiser | SimpleDenoiser = GuidedDenoiser(
+            v_context=None,
+            a_context=a_ctx,
+            video_guider=None,
+            audio_guider=MultiModalGuider(
+                params=MultiModalGuiderParams(
+                    cfg_scale=cfg_scale,
+                    stg_scale=stg_scale,
+                    stg_blocks=[29],
+                    rescale_scale=resc,
+                    modality_scale=1.0,
+                ),
+                negative_context=a_ctx_neg,
+            ),
+        )
+    else:
+        denoiser = SimpleDenoiser(v_context=None, a_context=a_ctx)
+
+    x0 = X0Model(velocity_model)
+    _, audio_state = euler_denoising_loop(
+        sigmas=sigmas,
+        video_state=None,
+        audio_state=state,
+        stepper=EulerDiffusionStep(),
+        transformer=BatchSplitAdapter(x0, max_batch_size=1),
+        denoiser=denoiser,
     )
-    logger.info("[DramaBox] TTSServer ready.")
-    _tts_servers[cache_key] = server
-    return server
+    # x0 and denoiser are always per-run; only velocity_model is reusable.
+    del x0, denoiser, a_ctx, a_ctx_neg
+    if not keep_warm:
+        del velocity_model
+    gc.collect()
+    torch.cuda.empty_cache()
+    logger.info("[DramaBox] Denoising complete.")
+
+    # ------------------------------------------------------------------
+    # Post-process latent
+    # ------------------------------------------------------------------
+    audio_state = audio_tools.clear_conditioning(audio_state)
+    audio_state = audio_tools.unpatchify(audio_state)
+
+    # Silence-prior fix: LTX-2.3 has a clip-end silence spike at frame 513.
+    latent = audio_state.latent
+    if latent.shape[2] > 513:
+        patched = latent.clone()
+        for fi in (512, 513):
+            t_lerp = (fi - 511) / 3
+            patched[:, :, fi, :] = (
+                (1.0 - t_lerp) * latent[:, :, 511, :]
+                + t_lerp * latent[:, :, 514, :]
+            )
+        latent = patched
+
+    # ------------------------------------------------------------------
+    # Stage 4 / 4 — Audio decoding (AudioDecoder: load/cache → decode → free/cache)
+    # ------------------------------------------------------------------
+    logger.info("[DramaBox] Stage 4/4: Decoding latent to waveform…")
+    if keep_warm and "audio_decoder" in _model_cache:
+        logger.info("[DramaBox] Stage 4/4: Using cached AudioDecoder.")
+        ad = _model_cache["audio_decoder"]
+    else:
+        ad = AudioDecoder(
+            checkpoint_path=paths["audio_components"], dtype=dtype, device=device
+        )
+        if keep_warm:
+            _model_cache["audio_decoder"] = ad
+            _model_cache["_key"] = _cache_key
+
+    decoded = ad(latent)
+    if not keep_warm:
+        del ad
+        gc.collect()
+        torch.cuda.empty_cache()
+
+    logger.info("[DramaBox] Generation complete.")
+    return decoded.waveform, decoded.sampling_rate
 
 
 # ---------------------------------------------------------------------------
@@ -316,25 +608,13 @@ class DramaBoxTTS:
                         ),
                     },
                 ),
-                "text_encoder_checkpoint": (
-                    _list_text_encoder_checkpoints(),
-                    {
-                        "tooltip": (
-                            "Gemma text encoder weight file from ComfyUI models/text_encoders/ "
-                            "(or models/checkpoints/). Select any .safetensors shard from the "
-                            "encoder directory (e.g. unsloth/gemma-3-12b-it-bnb-4bit). "
-                            "The directory must also contain tokenizer.model and "
-                            "preprocessor_config.json."
-                        ),
-                    },
-                ),
                 "quantization": (
                     ["4bit", "none"],
                     {
                         "default": "4bit",
                         "tooltip": (
-                            "Text-encoder quantization mode. Use 4bit for bnb quantized encoders; "
-                            "use none for full-precision encoder weights."
+                            "4bit: auto-downloads unsloth/gemma-3-12b-it-bnb-4bit (~8 GB, recommended). "
+                            "none: auto-downloads google/gemma-3-12b-it (~25 GB, full precision)."
                         ),
                     },
                 ),
@@ -396,6 +676,18 @@ class DramaBoxTTS:
                         ),
                     },
                 ),
+                "keep_models_warm": (
+                    "BOOLEAN",
+                    {
+                        "default": False,
+                        "tooltip": (
+                            "Keep all model components (Gemma, DiT transformer, audio codecs) "
+                            "loaded in memory between runs. "
+                            "Enables instant repeated generation but requires ~18+ GB VRAM. "
+                            "Leave off for 8-12 GB cards."
+                        ),
+                    },
+                ),
             },
         }
 
@@ -405,8 +697,10 @@ class DramaBoxTTS:
     CATEGORY = "audio/DramaBox"
     DESCRIPTION = (
         "DramaBox expressive TTS with voice cloning. "
-        "Generates dramatic, expressive speech from a structured scene prompt. "
-        "Requires ~24 GB VRAM on first run."
+        "Each model component (Gemma, DiT, AudioDecoder) is loaded, used, then freed "
+        "before the next loads — safe to run on GPUs with as little as 8 GB VRAM "
+        "(generation will be slower than on 24 GB but produces correct output). "
+        "Gemma is loaded with device_map=auto so its layers are spread across GPU + CPU RAM."
     )
 
     # ------------------------------------------------------------------
@@ -414,13 +708,13 @@ class DramaBoxTTS:
     def generate(
         self,
         text: str,
-        text_encoder_checkpoint: str,
         quantization: str,
         cfg_scale: float,
         stg_scale: float,
         voice_sample=None,
         seed: int = 42,
         duration_multiplier: float = 1.1,
+        keep_models_warm: bool = False,
     ):
         if not text or not text.strip():
             raise ValueError("[DramaBox] Text prompt cannot be empty.")
@@ -428,8 +722,8 @@ class DramaBoxTTS:
         if quantization not in {"4bit", "none"}:
             raise ValueError(f"[DramaBox] Unsupported quantization mode: {quantization}")
 
-        gemma_root = _resolve_and_validate_gemma_root(text_encoder_checkpoint)
-        server = _get_server(gemma_root=gemma_root, bnb_4bit=(quantization == "4bit"))
+        paths = _download_models(bnb_4bit=(quantization == "4bit"))
+        gemma_root = paths["gemma_root"]
 
         # ---- Write voice reference to a temp WAV if an AUDIO input was given ----
         tmp_wav = None
@@ -456,14 +750,18 @@ class DramaBoxTTS:
                     f"({waveform.shape[-1] / sr:.1f}s)"
                 )
 
-            # ---- Run inference ----
-            waveform_out, sr_out = server.generate(
+            # ---- Run staged offloaded inference ----
+            waveform_out, sr_out = _generate_offloaded(
+                gemma_root=gemma_root,
+                bnb_4bit=(quantization == "4bit"),
+                paths=paths,
                 prompt=text,
-                voice_ref=voice_ref_path,
+                voice_ref_path=voice_ref_path,
                 cfg_scale=cfg_scale,
                 stg_scale=stg_scale,
                 duration_multiplier=duration_multiplier,
                 seed=seed,
+                keep_warm=keep_models_warm,
             )
 
         finally:
