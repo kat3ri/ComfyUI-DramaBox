@@ -24,6 +24,36 @@ import folder_paths
 
 logger = logging.getLogger(__name__)
 
+
+def _save_audio(path: str, waveform: "torch.Tensor", sample_rate: int) -> None:
+    """Save audio, falling back gracefully when torchcodec is unavailable.
+
+    Recent torchaudio (≥2.6) defaults torchaudio.save() to the torchcodec backend
+    which may not be installed (especially on bleeding-edge CUDA builds). This
+    wrapper tries soundfile first, then falls back to the scipy/wave writer.
+    """
+    # Preferred: explicit soundfile backend (no torchcodec dependency)
+    try:
+        torchaudio.save(path, waveform, sample_rate, backend="soundfile")
+        return
+    except Exception:
+        pass
+
+    # Last resort: scipy wavfile (always available with numpy)
+    try:
+        import scipy.io.wavfile as _wavfile
+        import numpy as _np
+        data = waveform.numpy()
+        if data.ndim == 2:
+            data = data.T  # scipy expects (samples, channels)
+        _wavfile.write(path, sample_rate, data.astype(_np.float32))
+        return
+    except Exception:
+        pass
+
+    # Final fallback: let torchaudio pick whatever backend it has
+    torchaudio.save(path, waveform, sample_rate)
+
 # ---------------------------------------------------------------------------
 # Paths
 # ---------------------------------------------------------------------------
@@ -347,7 +377,7 @@ class DramaBoxTTS:
                 )
                 tmp_wav.close()
                 voice_ref_path = tmp_wav.name
-                torchaudio.save(voice_ref_path, waveform.float().cpu(), sr)
+                _save_audio(voice_ref_path, waveform.float().cpu(), sr)
                 logger.info(
                     f"[DramaBox] Voice reference saved to temp file: {voice_ref_path} "
                     f"({waveform.shape[-1] / sr:.1f}s)"
